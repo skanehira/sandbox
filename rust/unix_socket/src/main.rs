@@ -1,9 +1,9 @@
 #![allow(unused)]
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
-use std::iter::Map;
+use std::iter::{FromIterator, Map};
 use std::os::unix::net::UnixStream;
 
 pub trait ReadWriter: io::Read + io::Write {}
@@ -23,6 +23,12 @@ pub enum HttpMethod {
     Update,
     Delete,
     Patch,
+}
+
+impl Default for HttpMethod {
+    fn default() -> Self {
+        Self::Get
+    }
 }
 
 impl Display for HttpMethod {
@@ -55,24 +61,39 @@ impl Display for MapKey {
 }
 
 #[derive(Debug, Clone)]
-pub struct HttpHeader(HashMap<String, MapKey>);
+pub struct HttpHeader(BTreeMap<String, MapKey>);
 
 impl Display for HttpHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let mut buf = BufWriter::new(Vec::new());
+        let mut h = Vec::new();
         for (k, v) in self.0.iter() {
-            buf.write_fmt(format_args!("{} {}\r\n", k, v)).unwrap();
+            h.push(format!("{}: {}", k, v));
         }
-        write!(
-            f,
-            "{}",
-            String::from_utf8(buf.into_inner().unwrap()).unwrap()
-        )
+        write!(f, "{}", h.join("\r\n"),)
+    }
+}
+
+impl HttpHeader {
+    fn new() -> Self {
+        Self { 0: BTreeMap::new() }
+    }
+    fn add(&mut self, key: &str, value: MapKey) {
+        self.0.insert(key.to_string(), value);
+    }
+}
+
+impl<'a> FromIterator<(&'a str, MapKey)> for HttpHeader {
+    fn from_iter<T: IntoIterator<Item = (&'a str, MapKey)>>(iter: T) -> Self {
+        let mut p = Self::new();
+        for (k, v) in iter {
+            p.add(k, v);
+        }
+        p
     }
 }
 
 #[derive(Debug)]
-pub struct HttpParams(HashMap<String, MapKey>);
+pub struct HttpParams(BTreeMap<String, MapKey>);
 
 impl Display for HttpParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -84,9 +105,29 @@ impl Display for HttpParams {
     }
 }
 
+impl HttpParams {
+    fn new() -> Self {
+        Self { 0: BTreeMap::new() }
+    }
+    fn add(&mut self, key: &str, value: MapKey) {
+        self.0.insert(key.to_string(), value);
+    }
+}
+
+impl<'a> FromIterator<(&'a str, MapKey)> for HttpParams {
+    fn from_iter<T: IntoIterator<Item = (&'a str, MapKey)>>(iter: T) -> Self {
+        let mut p = Self::new();
+        for (k, v) in iter {
+            p.add(k, v);
+        }
+        p
+    }
+}
+
+#[derive(Default)]
 pub struct Request {
-    base_url: Option<String>,
     url: String,
+    base_url: Option<String>,
     method: HttpMethod,
     header: Option<HttpHeader>,
     params: Option<HttpParams>,
@@ -94,6 +135,44 @@ pub struct Request {
 }
 
 impl Request {
+    fn new(url: String) -> Self {
+        Self {
+            url,
+            ..Default::default()
+        }
+    }
+
+    fn base_url(&mut self, p: String) -> &mut Self {
+        self.base_url = Some(p);
+        self
+    }
+
+    fn method(&mut self, p: HttpMethod) -> &mut Self {
+        self.method = p;
+        self
+    }
+
+    fn header(&mut self, p: HttpHeader) -> &mut Self {
+        self.header = Some(p);
+        self
+    }
+
+    fn params(&mut self, p: HttpParams) -> &mut Self {
+        self.params = Some(p);
+        self
+    }
+
+    fn body(&mut self, p: Vec<u8>) -> &mut Self {
+        self.body = Some(p);
+        self
+    }
+
+    fn get(url: String) -> Self {
+        let mut request = Self::new(url);
+        request.method(HttpMethod::Get);
+        request
+    }
+
     fn build(&mut self) -> Vec<u8> {
         let url = match &self.params {
             Some(params) => {
@@ -154,7 +233,7 @@ impl<T: ReadWriter> HttpClient<T> {
             .map_err(|_| "cannot parse to number".to_string())?;
 
         // read headers
-        let mut header = HttpHeader(HashMap::new());
+        let mut header = HttpHeader(BTreeMap::new());
         loop {
             buf.clear();
             let readed = r
@@ -255,20 +334,65 @@ fn main() -> std::io::Result<()> {
 
 #[cfg(test)]
 mod test {
-    use crate::{HttpMethod, Request};
+    use std::collections::BTreeMap;
+
+    use super::*;
 
     #[test]
     fn request_build() {
         let mut req = Request {
-            base_url: None,
             url: "/images/json".to_string(),
             method: HttpMethod::Get,
-            header: None,
-            params: None,
-            body: None,
+            ..Default::default()
         };
-        let want = "GET /images/json HTTP/1.1\r\nHost: localhost\r\n\r\n".as_bytes();
-        let got = req.build();
+        let want = ["GET /images/json HTTP/1.1", "Host: localhost", "", ""].join("\r\n");
+        let got = String::from_utf8(req.build()).unwrap();
+        assert_eq!(want, got);
+    }
+
+    #[test]
+    fn request_get() {
+        let mut req = Request::get("/images/json".to_string());
+        let want = ["GET /images/json HTTP/1.1", "Host: localhost", "", ""].join("\r\n");
+        let got = String::from_utf8(req.build()).unwrap();
+        assert_eq!(want, got);
+    }
+
+    #[test]
+    fn request_with_options() {
+        let mut req = Request::new("/images/json".into());
+        let params: HttpParams = [
+            ("name", MapKey::String("nvim".into())),
+            ("image", MapKey::String("ubuntu".into())),
+        ]
+        .into_iter()
+        .collect();
+
+        let mut header: HttpHeader = [
+            ("bar", MapKey::Number(1000)),
+            ("foo", MapKey::String("value".into())),
+        ]
+        .into_iter()
+        .collect();
+
+        let body = "test body".to_string().as_bytes().to_vec();
+
+        req.method(HttpMethod::Get)
+            .params(params)
+            .header(header)
+            .body(body);
+
+        let want = [
+            "GET /images/json?image=ubuntu&name=nvim HTTP/1.1",
+            "Host: localhost",
+            "bar: 1000",
+            "foo: value",
+            "",
+            "test body",
+            "",
+        ]
+        .join("\r\n");
+        let got = String::from_utf8(req.build()).unwrap();
         assert_eq!(want, got);
     }
 }
