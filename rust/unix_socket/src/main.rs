@@ -4,6 +4,7 @@ use std::collections::BTreeMap;
 use std::fmt::Display;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::iter::{FromIterator, Map};
+use std::net::TcpStream;
 use std::os::unix::net::UnixStream;
 
 pub trait ReadWriter: io::Read + io::Write {}
@@ -45,23 +46,7 @@ impl Display for HttpMethod {
 }
 
 #[derive(Debug, Clone)]
-pub enum MapKey {
-    String(String),
-    Number(isize),
-}
-
-impl Display for MapKey {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        let key = match self {
-            Self::String(s) => s.to_owned(),
-            Self::Number(n) => n.clone().to_string(),
-        };
-        write!(f, "{}", key)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct HttpHeader(BTreeMap<String, MapKey>);
+pub struct HttpHeader(BTreeMap<String, String>);
 
 impl Display for HttpHeader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -77,13 +62,16 @@ impl HttpHeader {
     fn new() -> Self {
         Self { 0: BTreeMap::new() }
     }
-    fn add(&mut self, key: &str, value: MapKey) {
-        self.0.insert(key.to_string(), value);
+    fn add(&mut self, key: &str, value: &str) {
+        self.0.insert(key.into(), value.into());
+    }
+    fn get(&self, key: &str) -> Option<&String> {
+        return self.0.get(key.into());
     }
 }
 
-impl<'a> FromIterator<(&'a str, MapKey)> for HttpHeader {
-    fn from_iter<T: IntoIterator<Item = (&'a str, MapKey)>>(iter: T) -> Self {
+impl<'a> FromIterator<(&'a str, &'a str)> for HttpHeader {
+    fn from_iter<T: IntoIterator<Item = (&'a str, &'a str)>>(iter: T) -> Self {
         let mut p = Self::new();
         for (k, v) in iter {
             p.add(k, v);
@@ -93,7 +81,7 @@ impl<'a> FromIterator<(&'a str, MapKey)> for HttpHeader {
 }
 
 #[derive(Debug)]
-pub struct HttpParams(BTreeMap<String, MapKey>);
+pub struct HttpParams(BTreeMap<String, String>);
 
 impl Display for HttpParams {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -109,13 +97,13 @@ impl HttpParams {
     fn new() -> Self {
         Self { 0: BTreeMap::new() }
     }
-    fn add(&mut self, key: &str, value: MapKey) {
-        self.0.insert(key.to_string(), value);
+    fn add(&mut self, key: &str, value: &str) {
+        self.0.insert(key.into(), value.into());
     }
 }
 
-impl<'a> FromIterator<(&'a str, MapKey)> for HttpParams {
-    fn from_iter<T: IntoIterator<Item = (&'a str, MapKey)>>(iter: T) -> Self {
+impl<'a> FromIterator<(&'a str, &'a str)> for HttpParams {
+    fn from_iter<T: IntoIterator<Item = (&'a str, &'a str)>>(iter: T) -> Self {
         let mut p = Self::new();
         for (k, v) in iter {
             p.add(k, v);
@@ -167,8 +155,8 @@ impl Request {
         self
     }
 
-    fn get(url: String) -> Self {
-        let mut request = Self::new(url);
+    fn get(url: &str) -> Self {
+        let mut request = Self::new(url.into());
         request.method(HttpMethod::Get);
         request
     }
@@ -244,22 +232,24 @@ impl<T: ReadWriter> HttpClient<T> {
                 return Err("unexpected endof".to_string());
             }
 
-            let line = String::from_utf8(buf.clone())
+            let mut line = String::from_utf8(buf.clone())
                 .map_err(|_| "cannot coonvert bytes to string".to_string())?;
             if line == "\r\n" {
                 break;
             }
-            let mut cols = line.split_whitespace();
+            line = line.trim().to_string();
+
+            let mut cols = line.split(": ");
             let key = cols
                 .next()
                 .ok_or_else(|| "invalid header key".to_string())?
-                .to_string();
+                .to_lowercase();
+            let key = key.as_str();
             let val = cols
                 .next()
-                .ok_or_else(|| "invalid header value".to_string())?
-                .to_string()
-                .to_string();
-            header.0.insert(key, MapKey::String(val));
+                .ok_or_else(|| "invalid header value".to_string())?;
+
+            header.add(key, val);
         }
 
         match status {
@@ -274,33 +264,62 @@ impl<T: ReadWriter> HttpClient<T> {
             _ => {}
         }
 
-        // read body
-        let mut body = Vec::new();
-        loop {
-            buf.clear();
-            let readed = r.read_until(b'\n', &mut buf).unwrap();
-            if readed == 0 {
-                break;
-            }
+        let tf = header.get("transfer-encoding");
+        let cl = header.get("content-length");
 
-            let line = String::from_utf8(buf.clone())
-                .map_err(|_| "cannot coonvert bytes to string".to_string())?;
-            let chunk_size = i64::from_str_radix(line.trim(), 16).map_err(|err| {
-                format!("cannot read chunk length: {}: {}", line, err).to_string()
-            })?;
-
-            if chunk_size == 0 {
-                r.read_until(b'\n', &mut buf);
-                break;
-            }
-
-            let mut chunk = vec![0u8; chunk_size as usize];
-            r.read_exact(&mut chunk).unwrap();
-            body.append(&mut chunk);
-
-            // consume \r\n
-            r.read_until(b'\n', &mut buf);
+        if tf.is_none() && cl.is_none() {
+            return Err("missing transfer-encoding or content-length".into());
         }
+
+        let is_chunked = tf.map(|x| x.to_owned() == "chunked").unwrap_or(false);
+
+        let mut body = Vec::new();
+        if is_chunked {
+            // read body
+            loop {
+                buf.clear();
+                let readed = r.read_until(b'\n', &mut buf).unwrap();
+                if readed == 0 {
+                    break;
+                }
+
+                let line = String::from_utf8(buf.clone())
+                    .map_err(|_| "cannot coonvert bytes to string".to_string())?;
+                let chunk_size = i64::from_str_radix(line.trim(), 16).map_err(|err| {
+                    format!("cannot read chunk length: {}: {}", line, err).to_string()
+                })?;
+
+                if chunk_size == 0 {
+                    r.read_until(b'\n', &mut buf);
+                    break;
+                }
+
+                let mut chunk = vec![0u8; chunk_size as usize];
+                r.read_exact(&mut chunk).unwrap();
+                body.append(&mut chunk);
+
+                // consume \r\n
+                r.read_until(b'\n', &mut buf);
+            }
+        } else {
+            let value = header.get("content-length");
+            if value.is_none() {
+                return Err("not found content-length".into());
+            }
+            let value = value.unwrap().parse::<isize>();
+
+            match value {
+                Ok(size) => {
+                    let mut buf = vec![0u8; size.to_owned() as usize];
+                    r.read_exact(&mut buf).unwrap();
+                    body = buf;
+                }
+                Err(e) => {
+                    return Err(e.to_string());
+                }
+            };
+        }
+
         let resp = Response {
             status,
             header,
@@ -309,7 +328,7 @@ impl<T: ReadWriter> HttpClient<T> {
         Ok(resp)
     }
 
-    fn request(&mut self, req: &mut Request) -> Result<Response, String> {
+    fn execute_request(&mut self, req: &mut Request) -> Result<Response, String> {
         let body = req.build();
         self.conn.write_all(&body).unwrap();
         self.read_response()
@@ -319,15 +338,8 @@ impl<T: ReadWriter> HttpClient<T> {
 fn main() -> std::io::Result<()> {
     let conn = UnixStream::connect("/var/run/docker.sock")?;
     let mut client = HttpClient::new(conn);
-    let mut req = Request {
-        base_url: Some("localhost".to_string()),
-        url: "/images/json".to_string(),
-        method: HttpMethod::Get,
-        header: None,
-        params: None,
-        body: None,
-    };
-    let resp = client.request(&mut req).unwrap();
+    let mut req = Request::get("/images/json");
+    let resp = client.execute_request(&mut req).unwrap();
     print!("{}", String::from_utf8(resp.body.unwrap()).unwrap());
     Ok(())
 }
@@ -352,7 +364,7 @@ mod test {
 
     #[test]
     fn request_get() {
-        let mut req = Request::get("/images/json".to_string());
+        let mut req = Request::get("/images/json");
         let want = ["GET /images/json HTTP/1.1", "Host: localhost", "", ""].join("\r\n");
         let got = String::from_utf8(req.build()).unwrap();
         assert_eq!(want, got);
@@ -361,19 +373,11 @@ mod test {
     #[test]
     fn request_with_options() {
         let mut req = Request::new("/images/json".into());
-        let params: HttpParams = [
-            ("name", MapKey::String("nvim".into())),
-            ("image", MapKey::String("ubuntu".into())),
-        ]
-        .into_iter()
-        .collect();
+        let params: HttpParams = [("name", "nvim"), ("image", "ubuntu")]
+            .into_iter()
+            .collect();
 
-        let mut header: HttpHeader = [
-            ("bar", MapKey::Number(1000)),
-            ("foo", MapKey::String("value".into())),
-        ]
-        .into_iter()
-        .collect();
+        let mut header: HttpHeader = [("bar", "1000"), ("foo", "value")].into_iter().collect();
 
         let body = "test body".to_string().as_bytes().to_vec();
 
